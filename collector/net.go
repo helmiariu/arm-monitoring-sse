@@ -1,57 +1,108 @@
 package collector
 
 import (
-	"math"
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
 	"time"
-
-	"github.com/shirou/gopsutil/v4/net"
 )
 
-// Variabel global untuk mengingat data dari loop sebelumnya (State)
 var (
-	prevBytesRecv uint64
-	prevBytesSent uint64
-	prevTime      time.Time
+	prevRx   uint64
+	prevTx   uint64
+	prevTime time.Time
+
+	// 💡 Variabel tambahan untuk menampung cache
+	cachedInterface string
+	lastChecked     time.Time
 )
 
-// GetNetworkSpeed menghitung kecepatan internet (Download & Upload) dalam satuan KB/s
+// 🔍 Fungsi Deteksi Otomatis dengan Fitur Cache 10 Detik
+func getActiveWANInterface() string {
+	// Opsi Paksa Manual lewat ENV tetap diprioritaskan
+	if envIface := os.Getenv("INTERFACE"); envIface != "" {
+		return envIface
+	}
+
+	// 🚀 JIKA cache sudah ada DAN belum lewat 10 detik, gunakan cache saja! (Hemat CPU)
+	if cachedInterface != "" && time.Since(lastChecked) < 10*time.Second {
+		return cachedInterface
+	}
+
+	// Bagian ini hanya dieksekusi 10 detik sekali jika cache kedaluwarsa
+	file, err := os.Open("/proc/net/route")
+	if err != nil {
+		if cachedInterface != "" {
+			return cachedInterface // Gunakan cache lama jika file error
+		}
+		return "eth0"
+	}
+	defer file.Close()
+
+	foundInterface := "eth0" // Fallback default
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 2 && fields[1] == "00000000" {
+			foundInterface = fields[0]
+			break
+		}
+	}
+
+	// 💾 Perbarui data cache dan waktu pengecekan terakhir
+	cachedInterface = foundInterface
+	lastChecked = time.Now()
+
+	return cachedInterface
+}
+
+// 🚀 Fungsi Utama (Tetap berjalan setiap detik, tapi pemanggilan fungsinya jadi sangat ringan)
 func GetNetworkSpeed() (float64, float64) {
-	// false berarti menggabungkan semua interface (eth0, wlan0, lo) menjadi satu total
-	counters, err := net.IOCounters(false)
-	if err != nil || len(counters) == 0 {
-		return 0.0, 0.0
+	// Memanggil fungsi deteksi (yang sekarang sudah pintar & menggunakan cache)
+	targetInterface := getActiveWANInterface()
+
+	file, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return 0, 0
+	}
+	defer file.Close()
+
+	var currentRx, currentTx uint64
+	now := time.Now()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, targetInterface) {
+			fields := strings.Fields(line)
+			if len(fields) < 10 {
+				continue
+			}
+			currentRx, _ = strconv.ParseUint(fields[1], 10, 64)
+			currentTx, _ = strconv.ParseUint(fields[9], 10, 64)
+			break
+		}
 	}
 
-	currentBytesRecv := counters[0].BytesRecv
-	currentBytesSent := counters[0].BytesSent
-	currentTime := time.Now()
-
-	// Jika baru pertama kali aplikasi berjalan, simpan data awal dan return 0.0
 	if prevTime.IsZero() {
-		prevBytesRecv = currentBytesRecv
-		prevBytesSent = currentBytesSent
-		prevTime = currentTime
-		return 0.0, 0.0
+		prevRx = currentRx
+		prevTx = currentTx
+		prevTime = now
+		return 0, 0
 	}
 
-	// Hitung seberapa lama jeda waktu asli yang terjadi sejak loop terakhir (dalam detik)
-	duration := currentTime.Sub(prevTime).Seconds()
+	duration := now.Sub(prevTime).Seconds()
 	if duration <= 0 {
-		return 0.0, 0.0
+		duration = 1
 	}
 
-	// Hitung selisih bytes lalu konversi ke Kilobytes per Detik (KB/s)
-	deltaRecv := float64(currentBytesRecv - prevBytesRecv)
-	deltaSent := float64(currentBytesSent - prevBytesSent)
+	downloadSpeed := (float64(currentRx-prevRx) / duration) / 1024
+	uploadSpeed := (float64(currentTx-prevTx) / duration) / 1024
 
-	downloadSpeed := (deltaRecv / 1024.0) / duration
-	uploadSpeed := (deltaSent / 1024.0) / duration
+	prevRx = currentRx
+	prevTx = currentTx
+	prevTime = now
 
-	// Simpan data sekarang ke variabel global untuk modal hitungan di loop berikutnya
-	prevBytesRecv = currentBytesRecv
-	prevBytesSent = currentBytesSent
-	prevTime = currentTime
-
-	// Bulatkan menjadi 1 angka di belakang koma sesuai seleramu
-	return math.Round(downloadSpeed*10) / 10, math.Round(uploadSpeed*10) / 10
+	return downloadSpeed, uploadSpeed
 }

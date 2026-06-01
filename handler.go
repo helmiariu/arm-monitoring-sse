@@ -40,9 +40,6 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
 
-		fmt.Printf("[LOG] CPU: %.1f%% | Temp: %.1f°C | Net: ↓%.1f KB/s ↑%.1f KB/s\n",
-			status.CPUUsage, status.CPUTemp, status.Download, status.Upload)
-
 		time.Sleep(1 * time.Second)
 	}
 }
