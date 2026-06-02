@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,7 +17,9 @@ var (
 	// 💡 Variabel tambahan untuk menampung cache
 	cachedInterface string
 	lastChecked     time.Time
+	netMu           sync.Mutex
 )
+
 
 // 🔍 Fungsi Deteksi Otomatis dengan Fitur Cache 10 Detik
 func getActiveWANInterface() string {
@@ -25,16 +28,22 @@ func getActiveWANInterface() string {
 		return envIface
 	}
 
-	// 🚀 JIKA cache sudah ada DAN belum lewat 10 detik, gunakan cache saja! (Hemat CPU)
+	netMu.Lock()
 	if cachedInterface != "" && time.Since(lastChecked) < 10*time.Second {
-		return cachedInterface
+		val := cachedInterface
+		netMu.Unlock()
+		return val
 	}
+	netMu.Unlock()
 
 	// Bagian ini hanya dieksekusi 10 detik sekali jika cache kedaluwarsa
 	file, err := os.Open("/proc/net/route")
 	if err != nil {
-		if cachedInterface != "" {
-			return cachedInterface // Gunakan cache lama jika file error
+		netMu.Lock()
+		val := cachedInterface
+		netMu.Unlock()
+		if val != "" {
+			return val // Gunakan cache lama jika file error
 		}
 		return "eth0"
 	}
@@ -51,10 +60,13 @@ func getActiveWANInterface() string {
 	}
 
 	// 💾 Perbarui data cache dan waktu pengecekan terakhir
+	netMu.Lock()
 	cachedInterface = foundInterface
 	lastChecked = time.Now()
+	val := cachedInterface
+	netMu.Unlock()
 
-	return cachedInterface
+	return val
 }
 
 // 🚀 Fungsi Utama (Tetap berjalan setiap detik, tapi pemanggilan fungsinya jadi sangat ringan)
@@ -84,6 +96,9 @@ func GetNetworkSpeed() (float64, float64) {
 			break
 		}
 	}
+
+	netMu.Lock()
+	defer netMu.Unlock()
 
 	if prevTime.IsZero() {
 		prevRx = currentRx

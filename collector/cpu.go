@@ -7,18 +7,39 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
 )
 
-// GetCPUUsage menghitung persentase beban CPU dengan sampling 500ms
-func GetCPUUsage() float64 {
-	percentages, err := cpu.Percent(500*time.Millisecond, false)
-	if err != nil || len(percentages) == 0 {
-		return 0.0
+var (
+	cachedCPUUsage float64
+	cpuUsageMu     sync.RWMutex
+)
+
+// StartCPUSampler menjalankan background sampling beban CPU setiap detik secara non-blocking
+func StartCPUSampler() {
+	for {
+		percentages, err := cpu.Percent(500*time.Millisecond, false)
+		var val float64
+		if err == nil && len(percentages) > 0 {
+			val = math.Round(percentages[0]*100) / 100
+		}
+		cpuUsageMu.Lock()
+		cachedCPUUsage = val
+		cpuUsageMu.Unlock()
+		
+		// Jeda sebelum pengambilan sampel berikutnya
+		time.Sleep(500 * time.Millisecond)
 	}
-	return math.Round(percentages[0]*100) / 100
+}
+
+// GetCPUUsage mengembalikan persentase beban CPU secara instan & non-blocking dari cache
+func GetCPUUsage() float64 {
+	cpuUsageMu.RLock()
+	defer cpuUsageMu.RUnlock()
+	return cachedCPUUsage
 }
 
 // Membuat variabel global untuk mengingat jalur yang sukses

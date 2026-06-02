@@ -1,72 +1,15 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
-
-	"arm-monitoring-sse/collector"
 )
-
-// Broker mengelola koneksi client dan distribusi data
-type Broker struct {
-	clients   map[chan []byte]bool
-	broadcast chan []byte
-	mu        sync.Mutex
-}
-
-var broker = &Broker{
-	clients:   make(map[chan []byte]bool),
-	broadcast: make(chan []byte),
-}
-
-// StartBroadcaster menjalankan satu loop tunggal untuk polling data
-// Panggil fungsi ini di main.go
-func StartBroadcaster() {
-	for {
-		// 1. Ambil data HANYA SATU KALI per detik
-		downSpeed, upSpeed := collector.GetNetworkSpeed()
-		status := collector.ServerStatus{
-			CPUUsage: collector.GetCPUUsage(),
-			CPUTemp:  collector.GetCPUTemperature(),
-			Download: downSpeed,
-			Upload:   upSpeed,
-		}
-
-		// 2. Ubah ke JSON
-		jsonData, _ := json.Marshal(status)
-
-		// 3. Kirim ke channel broadcast
-		broker.broadcast <- jsonData
-
-		time.Sleep(1 * time.Second)
-	}
-}
-
-// Menangani distribusi data ke semua klien yang terhubung
-func StartDistributor() {
-	for {
-		msg := <-broker.broadcast
-		broker.mu.Lock()
-		for clientChan := range broker.clients {
-			// Kirim data ke setiap channel klien
-			select {
-			case clientChan <- msg:
-			default:
-				// Jika client lambat, jangan block sistem
-			}
-		}
-		broker.mu.Unlock()
-	}
-}
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -74,25 +17,77 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Buat channel unik untuk perangkat ini
-	messageChan := make(chan []byte)
+	// 💡 KOREKSI UTAMA: Gunakan fungsi getClientIP dari middleware.go
+	// Agar user di balik Cloudflare/Proxy terhitung sebagai IP unik yang akurat.
+	ip := getClientIP(r)
 
-	// Daftarkan ke broker
+	messageChan := make(chan []byte, 1)
+
+	// Daftarkan client ke broker
 	broker.mu.Lock()
-	broker.clients[messageChan] = true
+	broker.clients[messageChan] = ip
 	broker.mu.Unlock()
 
-	// Hapus pendaftaran saat koneksi ditutup
+	// Bersihkan client saat koneksi terputus (tab browser ditutup)
 	defer func() {
 		broker.mu.Lock()
 		delete(broker.clients, messageChan)
-		close(messageChan)
 		broker.mu.Unlock()
+
+		// 💡 CATATAN KEAMANAN: close() di sini 100% aman karena pembacaan map
+		// di StartDistributor dilindungi oleh Mutex Lock yang sama.
+		close(messageChan)
 	}()
 
-	// Tunggu data dari broker dan kirim ke browser
-	for msg := range messageChan {
-		fmt.Fprintf(w, "data: %s\n\n", msg)
-		flusher.Flush()
+	ctx := r.Context()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Browser client menutup koneksi atau pindah halaman
+			return
+		case msg, ok := <-messageChan:
+			if !ok {
+				return
+			}
+			// Kirim data dengan format standar SSE (data: <json>\n\n)
+			_, err := fmt.Fprintf(w, "data: %s\n\n", msg)
+			if err != nil {
+				return
+			}
+			flusher.Flush()
+		}
 	}
+}
+
+func loadtestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+
+	loadtestMu.Lock()
+	defer loadtestMu.Unlock()
+
+	// Mekanisme Cooldown: Batasi trigger loadtest maksimal 1x per 200ms
+	now := time.Now()
+	if now.Sub(lastLoadtestTime) < 200*time.Millisecond {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"Terlalu banyak permintaan, coba lagi nanti"}`))
+		return
+	}
+	lastLoadtestTime = now
+
+	// Naikkan nilai loadtest simulasi hingga batasan 5000
+	if loadtestValue < 5000 {
+		loadtestValue += 250
+		if loadtestValue > 5000 {
+			loadtestValue = 5000
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"loadtest_triggered"}`))
 }
